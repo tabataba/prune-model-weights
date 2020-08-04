@@ -78,7 +78,7 @@ def get_fouts(net,name,function,locked_masks):
     return fouts, mask_outs
 
 
-def prune_step(net,locked_masks):
+def prune_grad(net,locked_masks):
     for n, w in net.named_parameters():  
         if w.grad is not None and n in locked_masks: 
             w.grad[locked_masks[n]] = 0
