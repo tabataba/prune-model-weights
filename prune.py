@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import time
 
 
 def correct(test_loader,net):
@@ -20,13 +21,15 @@ def correct(test_loader,net):
 def prune_diag(net,masks):
     #outputs how many weights have been pruned, true = pruned
     
-    print('name     false  true  total')
+    #print('name     false  true  total')
+    print('name       pruned percentage')
     for n, w in net.named_parameters():
         em = masks[n]     
         isf = np.sum(~em.data.numpy())
         ist = np.sum(em.data.numpy())
         
-        print(n,isf,ist,isf+ist)
+        #print(n,isf,ist,isf+ist)
+        print(n,ist/(isf+ist))
         
     
 def get_other_weight(n,net):
@@ -37,10 +40,31 @@ def get_other_weight(n,net):
         
     if n.endswith('weight'):
         other_name= n.split('.')[0]+'.bias'
-        
-    other_weight=net.state_dict()[other_name]
     
-    return other_weight.clone()
+    if other_name in net.state_dict():
+        other_weight=net.state_dict()[other_name]
+        out = other_weight.clone()
+    else:
+        out = None
+        
+    return out
+
+def get_other_mask(n,mask):
+    
+    #for layer with weights n (bias or weight), outputs mask of other weights (weight or bias)
+    if n.endswith('bias'):
+        other_name= n.split('.')[0]+'.weight'
+        
+    if n.endswith('weight'):
+        other_name= n.split('.')[0]+'.bias'
+    
+    if other_name in mask:
+        other_mask=mask[other_name]
+        out = other_mask.clone()
+    else:
+        out = None
+    
+    return out
 
 
 def get_weights(n,net):
@@ -60,6 +84,15 @@ def get_fout(n,net,function):
     edge_weight, unit_weight = get_weights(n,net)
     return function(edge_weight,unit_weight)
 
+def get_fout_wb(n,net,function,function_bias):
+    #returns output of either the weight or the bias function
+    edge_weight, unit_weight = get_weights(n,net)
+    out = None
+    if n.endswith('weight') and function is not None:
+        out = function(edge_weight,unit_weight)
+    if n.endswith('bias') and function_bias is not None:
+        out = function_bias(edge_weight,unit_weight)
+    return out
 
 def get_fouts(net,name,function,locked_masks):
     # returns output of threshold function and corresponding locked mask for all layers
@@ -77,6 +110,21 @@ def get_fouts(net,name,function,locked_masks):
 
     return fouts, mask_outs
 
+def get_fouts2(net,name,fout_dict,locked_masks):
+    # returns output of threshold function and corresponding locked mask for all layers
+    
+    fouts = []
+    mask_outs = []
+    for n, w in net.named_parameters():
+        if n.endswith(name):
+            mask = locked_masks[n]
+            mask_outs.append(mask)
+
+            fout = fout_dict[n].clone()
+            fouts.append(fout)
+
+    return fouts, mask_outs
+
 
 def prune_grad(net,locked_masks):
     for n, w in net.named_parameters():  
@@ -86,7 +134,8 @@ def prune_grad(net,locked_masks):
             
     
 def prune(net, locked_masks, prune_random=False, prune_weight=True, prune_bias=False, ratio=None,
-          threshold=None, threshold_bias=None, function=None, function_bias=None, prune_across_layers=True):
+          threshold=None, threshold_bias=None, function=None, function_bias=None, prune_across_layers=True, 
+          prune_last_bias=False):
     #prunes a neural network (i.e. zeros weights and biases and keeps them at zero) according to different thresholding rules.
     #
         #prune_random: weights are pruned randomly according to ratio.
@@ -100,6 +149,13 @@ def prune(net, locked_masks, prune_random=False, prune_weight=True, prune_bias=F
     #set pruning ratio if none given
     if ratio is None: 
         ratio = 0.25
+    
+    last_bias = None  
+    bias_names = []
+    for n, w in net.named_parameters():
+        if n.endswith('bias'):
+            bias_names.append(n)
+    last_bias = bias_names[-1]
     
     if prune_random:
         for n, w in net.named_parameters():
@@ -115,8 +171,11 @@ def prune(net, locked_masks, prune_random=False, prune_weight=True, prune_bias=F
                 #set weights to zero according to mask
                 edge_weight = net.state_dict()[n]
                 edge_weight[mask] = 0
-
-            if prune_bias and n.endswith('bias'):
+            
+            flag = True
+            if last_bias == n and ~prune_last_bias: flag = False
+            if prune_bias and n.endswith('bias') and flag:
+                
                 
                 #update mask to set a number of remaining False values to True according to ratio
                 mask = locked_masks[n]
@@ -136,31 +195,35 @@ def prune(net, locked_masks, prune_random=False, prune_weight=True, prune_bias=F
 
         if prune_bias and function_bias is None:
             function_bias = lambda ew, uw: torch.sum(torch.abs(ew),dim=1) + torch.abs(uw)
-
+            
+        fout_dict={n: get_fout_wb(n,net,function,function_bias) for n, w in net.named_parameters()}
+            
         if prune_across_layers:
             if prune_weight and threshold is None:
                 
-                #get function output and prune mask in 1-dim format
-                fouts, mask_outs = get_fouts(net,'weight',function,locked_masks)
+                #fouts, mask_outs = get_fouts(net,'weight',function,locked_masks)
+                fouts, mask_outs = get_fouts2(net,'weight',fout_dict,locked_masks)
+                
                 fall = torch.cat([torch.flatten(fouts[i],start_dim=0,end_dim=-1) for i in range(len(fouts))])
                 mask_all = torch.cat([torch.flatten(mask_outs[i],start_dim=0,end_dim=-1) for i in range(len(mask_outs))])
                 
                 # compute number of edges to be pruned
-                prune_num = int(torch.round(torch.sum(~mask_all*ratio))) ###TODO need mask in 
+                prune_num = int(torch.round(torch.sum(~mask_all*ratio))) 
                 
                 # compute threshold
                 fallc = fall.clone()[~mask_all]
                 size1 = np.product(list(fallc.size()))
                 threshold, _ = torch.sort(fallc.view(size1, -1),dim=0)
                 threshold = float(threshold[prune_num])
-                #print(prune_num,threshold)
                 
             if prune_bias and threshold_bias is None:
                 
                 #get function output and prune mask in 1-dim format
-                fouts_bias, mask_outs_bias = get_fouts(net,'bias',function_bias,locked_masks)
-                fall = torch.cat([torch.flatten(fouts_bias[i],start_dim=0,end_dim=-1) for i in range(len(fouts))])
-                mask_all = torch.cat([torch.flatten(mask_outs_bias[i],start_dim=0,end_dim=-1) for i in range(len(mask_outs_bias))])
+                fouts_bias, mask_outs_bias = get_fouts2(net,'bias',fout_dict,locked_masks)
+                fall = torch.cat([torch.flatten(fouts_bias[i],start_dim=0,end_dim=-1) 
+                                  for i in range(len(fouts_bias))])
+                mask_all = torch.cat([torch.flatten(mask_outs_bias[i],start_dim=0,end_dim=-1) 
+                                      for i in range(len(mask_outs_bias))])
                 
                 # compute number of edges to be pruned
                 prune_num = int(torch.round(torch.sum(~mask_all*ratio)))
@@ -169,7 +232,9 @@ def prune(net, locked_masks, prune_random=False, prune_weight=True, prune_bias=F
                 fallc = fall.clone()[~mask_all]
                 size1 = np.product(list(fallc.size()))
                 threshold_bias, _ = torch.sort(fallc.view(size1, -1),dim=0)
+                
                 threshold_bias = float(threshold_bias[prune_num])
+                
                 
         if prune_weight:
             if threshold is None:
@@ -186,7 +251,7 @@ def prune(net, locked_masks, prune_random=False, prune_weight=True, prune_bias=F
                         prune_num = int(torch.round(torch.sum(~mask*ratio)))
 
                         #get function output
-                        fout = get_fout(n,net,function)
+                        fout = fout_dict[n] #get_fout(n,net,function)
 
                         # compute corresponding threshold
                         foutc = fout.clone()[~mask]
@@ -203,7 +268,7 @@ def prune(net, locked_masks, prune_random=False, prune_weight=True, prune_bias=F
                 for n, w in net.named_parameters():
                     if prune_weight and n.endswith('weight'):                         
 
-                        fout = get_fout(n,net,function)
+                        fout = fout_dict[n] #get_fout(n,net,function)
                         mask = locked_masks[n]
                         edge_weight = net.state_dict()[n]
                         
@@ -215,7 +280,10 @@ def prune(net, locked_masks, prune_random=False, prune_weight=True, prune_bias=F
             
                 # compute number of nodes to be pruned
                 for n, w in net.named_parameters():
-                    if n.endswith('bias'):
+                    flag = True
+                    if last_bias == n and ~prune_last_bias: flag = False
+                    if n.endswith('bias') and flag:
+                        
 
                         mask = locked_masks[n]
                         unit_weight = net.state_dict()[n]
@@ -225,7 +293,7 @@ def prune(net, locked_masks, prune_random=False, prune_weight=True, prune_bias=F
                         prune_num = int(torch.round(torch.sum(~mask*ratio)))
 
                         #get function output
-                        fout = get_fout(n,net,function_bias)
+                        fout = fout_dict[n] #get_fout(n,net,function_bias)
 
                         # compute corresponding threshold
                         foutc=fout.clone()[~mask]
@@ -240,12 +308,47 @@ def prune(net, locked_masks, prune_random=False, prune_weight=True, prune_bias=F
                 
                 #apply threshold
                 for n, w in net.named_parameters():
+                    
+                    flag = True
+                    if last_bias == n and ~prune_last_bias: flag = False
+                    if prune_bias and n.endswith('bias') and flag:
 
-                    if prune_bias and n.endswith('bias'):
-
-                        fout = get_fout(n,net,function_bias)
+                        fout = fout_dict[n] #get_fout(n,net,function_bias)  
                         mask = locked_masks[n]
                         unit_weight = net.state_dict()[n]
                         
                         mask[fout < threshold_bias] = True  
                         unit_weight[mask] = 0
+
+    
+    # clean_up edge weights and unit weights
+    for n, w in net.named_parameters():
+        
+        #remove edges that point towards removed units
+        if n.endswith('weight'):
+            edge_mask = locked_masks[n]
+            unit_mask = get_other_mask(n,locked_masks)
+            
+            if unit_mask is not None:
+                #print(np.sum(edge_mask.data.numpy()))
+                edge_mask[~(~edge_mask * ~torch.reshape(unit_mask, (-1,1)))] = True
+                #print(np.sum(edge_mask.data.numpy()))
+                
+                edge_weight = net.state_dict()[n]
+                edge_weight[edge_mask] = 0
+        
+        #remove units with no edges pointing towards it
+        flag = True
+        if last_bias == n and ~prune_last_bias: flag = False
+        if n.endswith('bias') and flag:
+            unit_mask = locked_masks[n]
+            edge_mask = get_other_mask(n,locked_masks)
+
+            if edge_mask is not None:
+                #print(np.sum(unit_mask.data.numpy()))
+                unit_mask[~(~unit_mask * (~edge_mask).bool().any(axis=1))] = True
+                #print(np.sum(unit_mask.data.numpy()))
+                
+                unit_weight = net.state_dict()[n]
+                unit_weight[unit_mask] = 0
+                
