@@ -325,7 +325,7 @@ def prune(net, locked_masks, prune_random=False, prune_weight=True, prune_bias=F
     for n, w in net.named_parameters():
         
         #remove edges that point towards removed units
-        if n.endswith('weight'):
+        if n.endswith('weight') and len(w.shape) < 3: # only works for 2d edge weights
             edge_mask = locked_masks[n]
             unit_mask = get_other_mask(n,locked_masks)
             
@@ -340,11 +340,12 @@ def prune(net, locked_masks, prune_random=False, prune_weight=True, prune_bias=F
         #remove units with no edges pointing towards it
         flag = True
         if last_bias == n and ~prune_last_bias: flag = False
+            
         if n.endswith('bias') and flag:
             unit_mask = locked_masks[n]
             edge_mask = get_other_mask(n,locked_masks)
 
-            if edge_mask is not None:
+            if edge_mask is not None and len(edge_mask.shape) < 3: # only works for 2d edge weights
                 #print(np.sum(unit_mask.data.numpy()))
                 unit_mask[~(~unit_mask * (~edge_mask).bool().any(axis=1))] = True
                 #print(np.sum(unit_mask.data.numpy()))
